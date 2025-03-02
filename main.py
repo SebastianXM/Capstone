@@ -5,6 +5,7 @@ import pickle
 import sklearn
 import torch.nn as nn
 import socket
+import math
 import pynmea2
 import numpy as np
 from gnuradio import gr, blocks, uhd
@@ -104,16 +105,25 @@ def get_location_and_direction(host, port, duration=5):
 
     start_time = time.time()
     location_data = []
+    direction_data = []
 
     while time.time() - start_time < duration:
         try:
             data = client_socket.recv(1024).decode("utf-8")
             if data:
-                try:
-                    msg = pynmea2.parse(data)
-                    location_data.append((msg.latitude, msg.longitude))
-                except pynmea2.ParseError as parse_err:
-                    print(f"Parse error: {parse_err}")
+                sentences = data.split("\r\n")
+                for sentence in sentences:
+                    if sentence.strip():
+                        try:
+                            msg = pynmea2.parse(data)
+                            if isinstance(msg, pynmea2.types.RMC):
+                                location_data.append((msg.latitude, msg.longitude))
+                            elif isinstance(msg, pynmea2.types.HDT):
+                                direction_data.append(msg.heading)
+                            else:
+                                print(f"Unhandled NMEA message type")
+                        except pynmea2.ParseError as parse_err:
+                            print(f"Parse error: {parse_err}")
             else:
                 print("No data received; the server may have closed the connection.")
                 break
@@ -122,7 +132,52 @@ def get_location_and_direction(host, port, duration=5):
             break
 
     client_socket.close()
-    return location_data
+    return location_data, direction_data
+
+
+def calculate_lat_long_direction(direction):
+    direction_rad = math.radians(direction)
+
+    delta_lat = math.cos(direction_rad)
+    delta_long = math.sin(direction_rad)
+
+    return delta_lat, delta_long
+
+
+def estimate_distance(rx_power):
+    """Estimate distance from signal strength using a simple path loss model"""
+    reference_strength = -40
+    path_loss_exponent = 2
+    distance = 10 ** ((reference_strength - rx_power) / (10 * path_loss_exponent))
+    return round(distance, 9)
+
+
+def estimate_angle(current_longitude, current_latitude, target_longitude, target_latitude):
+    """Calculate angle from current location to target location"""
+    d_lon = target_longitude - current_longitude
+    d_lat = target_latitude - current_latitude
+    angle = np.degrees(np.arctan2(d_lon, d_lat))
+
+    if angle < 0:
+        angle += 360
+
+    return angle
+
+
+def add_distance_to_long_lat(current_longitude, current_latitude, distance, angle):
+    earth_radius = 6371000
+    
+    lat_rad = math.radians(current_latitude)
+    lon_rad = math.radians(current_longitude)
+    angle_rad = math.radians(angle)
+
+    new_lat = math.asin(math.sin(lat_rad) * math.cos(distance / earth_radius) + math.cos(lat_rad) * math.sin(distance / earth_radius) * math.cos(angle_rad))
+    new_lon = lon_rad + math.atan2(math.sin(angle_rad) * math.sin(distance / earth_radius) * math.cos(lat_rad), math.cos(distance / earth_radius) - math.sin(lat_rad) * math.sin(new_lat))
+
+    new_lat = math.degrees(new_lat)
+    new_lon = math.degrees(new_lon)
+
+    return new_lon, new_lat
 
 
 def background_task(update_queue):
@@ -146,21 +201,28 @@ def background_task(update_queue):
         print("Getting location and direction...")
         host = "192.168.1.166"
         port = 11123
-        location_data = get_location_and_direction(host, port, duration=5)
-        if location_data:
-            print("Location data received")
+        location_data, direction_data = get_location_and_direction(host, port, duration=5)
+
+        if location_data and direction_data:
+            print("Location and direction data received")
             last_location = location_data[-1]
             rx_latitude = round(last_location[0], 9)
             rx_longitude = round(last_location[1], 9)
+            rx_direction = direction_data[-1]
         else:
-            print("Failed to get location data.")
-            rx_latitude, rx_longitude = 0, 0
+            print("Failed to get location or direction data.")
+            rx_latitude, rx_longitude, rx_direction = 0, 0, 0
 
         # Input data to the ML model
         print("Inputting data to the ML model...")
-        if location_data:
-            print(f"Last known location: Latitude={rx_latitude}, Longitude={rx_longitude}\n")
+        if location_data and direction_data:
+
+            print(f"Last known location and direction: Latitude={rx_latitude}, Longitude={rx_longitude}, Direction={rx_direction}\n")
             print(f"Rx Power: {rx_power}")
+
+            latitude_delta, longitude_delta = calculate_lat_long_direction(rx_direction)
+            print(f"Latitude delta: {latitude_delta}, Longitude delta: {longitude_delta}")
+            estimated_distance = estimate_distance(rx_power)
             try:
                 # NN model
                 '''
@@ -168,17 +230,24 @@ def background_task(update_queue):
                 model.load_state_dict(torch.load("NN_model.pth",weights_only=True))
                 model.eval()
                 with torch.no_grad():
-                    input_data = torch.tensor([rx_longitude, rx_latitude, 0, 0, rx_power]).float()
+                    input_data = torch.tensor([rx_longitude, rx_latitude, longitude_delta, latitude_delta, rx_power]).float()
                     output = model(input_data)
-                    print(f"Predicted location: Latitude={output[0]}, Longitude={output[1]}")
+                    predicted_latitude = output[0]
+                    predicted_longitude = output[1]
+                    print(f"Predicted location: Latitude={predicted_latitude}, Longitude={predicted_longitude}")
                 '''
-
+                
                 # ML model
                 ml_model = pickle.load(open("ml_model.pkl", "rb"))
-                output = ml_model.predict([[rx_longitude, rx_latitude, 0, 0, rx_power]])
-                predicted_latitude = output[0][0]
-                predicted_longitude = output[0][1]
-                print(f"Predicted location: Latitude={predicted_latitude}, Longitude={predicted_longitude}")
+                output = ml_model.predict([[rx_longitude, rx_latitude, longitude_delta, latitude_delta, rx_power, estimated_distance]])
+                predicted_longitude = output[0][0]
+                predicted_latitude = output[0][1]
+                predicted_distance = output[0][2]
+                estimated_angle = estimate_angle(rx_longitude, rx_latitude, predicted_longitude, predicted_latitude)
+
+                new_longitude, new_latitude = add_distance_to_long_lat(rx_longitude, rx_latitude, predicted_distance, estimated_angle)
+                print(f"Prediction: Latitude={new_latitude}, Longitude={new_longitude}, Distance={predicted_distance} meters, Angle={estimated_angle} degrees")
+
             except Exception as e:
                 print(f"Error: {e}")
                 predicted_latitude, predicted_longitude = 0, 0
@@ -186,10 +255,10 @@ def background_task(update_queue):
             predicted_latitude, predicted_longitude = 0, 0
             
         updates = {
-            "ml_prediction": (predicted_latitude, predicted_longitude),
+            "ml_prediction": (float(new_latitude), float(new_longitude)),
             "signal_strength": rx_power,
             "location": (rx_longitude, rx_latitude),
-            "direction": 0
+            "direction": rx_direction
         }
         update_queue.put(updates)
         print("Updates sent to UI\n")

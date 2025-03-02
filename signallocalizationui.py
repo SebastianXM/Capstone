@@ -110,13 +110,17 @@ class SignalLocalizationUI:
         """Calculate angle from current location to target location"""
         d_lon = target_longitude - current_longitude
         d_lat = target_latitude - current_latitude
-        angle = np.degrees(np.arctan2(d_lat, d_lon))
+        angle = np.degrees(np.arctan2(d_lon, d_lat))
+
+        if angle < 0:
+            angle += 360
+            
         return angle
     
     def update_ui(self):
         """Update the UI with new predictions"""
         predicted_latitude, predicted_longitude = self.ml_prediction
-        angle = self.calculate_angle(self.longitude, self.latitude, predicted_latitude, predicted_longitude)
+        angle = self.calculate_angle(self.longitude, self.latitude, predicted_longitude, predicted_latitude)
         signal_strength = self.signal_strength
         estimated_distance = self.estimate_distance(signal_strength)
         timestamp = time.strftime("%H:%M:%S")
@@ -140,7 +144,7 @@ class SignalLocalizationUI:
         
         # Update live data feed
         self.data_feed.config(state=tk.NORMAL)
-        self.data_feed.insert(tk.END, f"[{timestamp}] Angle: {angle }°, Signal: {signal_strength} dB, Distance: {estimated_distance} m\n")
+        self.data_feed.insert(tk.END, f"[{timestamp}] Angle: {angle}°, Signal Strength: {signal_strength} dB, Distance: {estimated_distance} m\n")
         self.data_feed.see(tk.END)
         self.data_feed.config(state=tk.DISABLED)
         
