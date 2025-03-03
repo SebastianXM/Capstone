@@ -116,10 +116,12 @@ def get_location_and_direction(host, port, duration=5):
                     if sentence.strip():
                         try:
                             msg = pynmea2.parse(data)
+                            
                             if isinstance(msg, pynmea2.types.RMC):
                                 location_data.append((msg.latitude, msg.longitude))
                             elif isinstance(msg, pynmea2.types.HDT):
                                 direction_data.append(msg.heading)
+                                print(f"Direction: {msg.heading}")
                             else:
                                 print(f"Unhandled NMEA message type")
                         except pynmea2.ParseError as parse_err:
@@ -199,7 +201,7 @@ def background_task(update_queue):
 
         # Get location and direction
         print("Getting location and direction...")
-        host = "192.168.1.166"
+        host = "10.61.2.141"
         port = 11123
         location_data, direction_data = get_location_and_direction(host, port, duration=5)
 

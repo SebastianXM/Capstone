@@ -2,7 +2,7 @@ import time
 import socket
 import pynmea2
 
-host = "192.168.1.166"
+host = "10.61.2.141"
 port = 11123
 
 # Create a socket object
@@ -23,7 +23,7 @@ except socket.error as err:
     exit(1)
 
 start_time = time.time()
-duration = 30 
+duration = 60 
 
 # Receive data from the server for 30 seconds
 while time.time() - start_time < duration:
@@ -49,6 +49,10 @@ while time.time() - start_time < duration:
                             print(f"Latitude: {msg.latitude}, Longitude: {msg.longitude}, Altitude: {msg.altitude} {msg.altitude_units}")
                         elif isinstance(msg, pynmea2.types.HDT):  # Heading, True
                             print(f"Heading (True): {msg.heading}")
+                        elif isinstance(msg, pynmea2.types.HDM):
+                            print(f"Heading (Magnetic): {msg.heading}")
+                        elif isinstance(msg, pynmea2.types.HDG):
+                            print(f": {msg.heading}")
                         else:
                             print(f"Unhandled NMEA message type: {msg.sentence_type}")
 
