@@ -4,18 +4,19 @@ import torch
 import pickle
 import sklearn
 import torch.nn as nn
-import socket
 import math
-import pynmea2
 import numpy as np
 from gnuradio import gr, blocks, uhd
 import threading
 import queue
 import tkinter as tk
 from tkinter import Tk
+from flask import Flask, request
+import json
 
 from signallocalizationui import SignalLocalizationUI
 
+last_values = {'x': 0, 'y': 0, 'z': 0}
 
 class RegressionNN(nn.Module):
   def __init__(self, input_size, hidden_size, output_size):
@@ -86,64 +87,49 @@ def calculate_power(rx_file_path):
     return rx_power
 
 
-# Function to get location and direction
-def get_location_and_direction(host, port, duration=5):
-    try:
-        client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        print("Socket created successfully")
-    except socket.error as err:
-        print(f"Socket creation failed with error: {err}")
-        return None
+def create_flask_app():
+    app = Flask(__name__)
 
-    try:
-        client_socket.connect((host, port))
-        print("Connected to the server successfully")
-    except socket.error as err:
-        print(f"Connection failed with error: {err}")
-        client_socket.close()
-        return None
-
-    start_time = time.time()
-    location_data = []
-    direction_data = []
-
-    while time.time() - start_time < duration:
+    @app.route('/data', methods=['POST'])
+    def recieve_data():
+        global last_values
         try:
-            data = client_socket.recv(1024).decode("utf-8")
-            if data:
-                sentences = data.split("\r\n")
-                for sentence in sentences:
-                    if sentence.strip():
-                        try:
-                            msg = pynmea2.parse(data)
-                            
-                            if isinstance(msg, pynmea2.types.RMC):
-                                location_data.append((msg.latitude, msg.longitude))
-                            elif isinstance(msg, pynmea2.types.HDT):
-                                direction_data.append(msg.heading)
-                                print(f"Direction: {msg.heading}")
-                            else:
-                                print(f"Unhandled NMEA message type")
-                        except pynmea2.ParseError as parse_err:
-                            print(f"Parse error: {parse_err}")
-            else:
-                print("No data received; the server may have closed the connection.")
-                break
-        except socket.error as err:
-            print(f"Data receive failed with error: {err}")
-            break
+            data = json.loads(request.data)
+            payload = data.get('payload')
 
-    client_socket.close()
-    return location_data, direction_data
+            # Extract data from payload
+            for entry in payload:
+                values = entry.get('values')
+                x = values.get('x')
+                y = values.get('y')
+                z = values.get('z')
 
+                last_values = {'x': x, 'y': y, 'z': z}
+                print(f"X: {x}, Y: {y}, Z: {z}")
 
-def calculate_lat_long_direction(direction):
-    direction_rad = math.radians(direction)
+            return "200"
+        except Exception as e:
+            print(e)
+            return "400"
+    return app
 
-    delta_lat = math.cos(direction_rad)
-    delta_long = math.sin(direction_rad)
+# Function to get direction
+def get_direction(host, port, duration=5):
+    global last_values
 
-    return delta_lat, delta_long
+    app = create_flask_app()
+    
+    server_thread = threading.Thread(target=lambda: app.run(host=host, port=port, debug=False, use_reloader=False))
+    server_thread.start()
+
+    try:
+        print(f"Flask server started at {host}:{port}")
+        threading.Event().wait(duration)
+    finally:
+        print("Shutting down Flask server...")
+        server_thread.join()
+    
+    return last_values['x'], last_values['y'], last_values['z']
 
 
 def estimate_distance(rx_power):
@@ -152,34 +138,6 @@ def estimate_distance(rx_power):
     path_loss_exponent = 2
     distance = 10 ** ((reference_strength - rx_power) / (10 * path_loss_exponent))
     return round(distance, 9)
-
-
-def estimate_angle(current_longitude, current_latitude, target_longitude, target_latitude):
-    """Calculate angle from current location to target location"""
-    d_lon = target_longitude - current_longitude
-    d_lat = target_latitude - current_latitude
-    angle = np.degrees(np.arctan2(d_lon, d_lat))
-
-    if angle < 0:
-        angle += 360
-
-    return angle
-
-
-def add_distance_to_long_lat(current_longitude, current_latitude, distance, angle):
-    earth_radius = 6371000
-    
-    lat_rad = math.radians(current_latitude)
-    lon_rad = math.radians(current_longitude)
-    angle_rad = math.radians(angle)
-
-    new_lat = math.asin(math.sin(lat_rad) * math.cos(distance / earth_radius) + math.cos(lat_rad) * math.sin(distance / earth_radius) * math.cos(angle_rad))
-    new_lon = lon_rad + math.atan2(math.sin(angle_rad) * math.sin(distance / earth_radius) * math.cos(lat_rad), math.cos(distance / earth_radius) - math.sin(lat_rad) * math.sin(new_lat))
-
-    new_lat = math.degrees(new_lat)
-    new_lon = math.degrees(new_lon)
-
-    return new_lon, new_lat
 
 
 def background_task(update_queue):
@@ -199,35 +157,20 @@ def background_task(update_queue):
         print("Calculating power...")
         rx_power = calculate_power(rx_file_path)
 
-        # Get location and direction
-        print("Getting location and direction...")
-        host = "10.61.2.141"
-        port = 11123
-        location_data, direction_data = get_location_and_direction(host, port, duration=5)
-
-        if location_data and direction_data:
-            print("Location and direction data received")
-            last_location = location_data[-1]
-            rx_latitude = round(last_location[0], 9)
-            rx_longitude = round(last_location[1], 9)
-            rx_direction = direction_data[-1]
-        else:
-            print("Failed to get location or direction data.")
-            rx_latitude, rx_longitude, rx_direction = 0, 0, 0
+        # Get direction
+        print("Getting direction...")
+        host = "10.61.3.198"
+        port = 8000
+        x_direction, y_direction, z_direction = get_direction(host, port, duration=5)
 
         # Input data to the ML model
         print("Inputting data to the ML model...")
-        if location_data and direction_data:
-
-            print(f"Last known location and direction: Latitude={rx_latitude}, Longitude={rx_longitude}, Direction={rx_direction}\n")
+        if x_direction and y_direction and z_direction:
+            print(f"Last known direction: x: {x_direction}, y: {y_direction}, z: {z_direction}\n")
             print(f"Rx Power: {rx_power}")
-
-            latitude_delta, longitude_delta = calculate_lat_long_direction(rx_direction)
-            print(f"Latitude delta: {latitude_delta}, Longitude delta: {longitude_delta}")
-            estimated_distance = estimate_distance(rx_power)
+        '''
             try:
                 # NN model
-                '''
                 model = RegressionNN(5, 64, 2)
                 model.load_state_dict(torch.load("NN_model.pth",weights_only=True))
                 model.eval()
@@ -237,7 +180,6 @@ def background_task(update_queue):
                     predicted_latitude = output[0]
                     predicted_longitude = output[1]
                     print(f"Predicted location: Latitude={predicted_latitude}, Longitude={predicted_longitude}")
-                '''
                 
                 # ML model
                 ml_model = pickle.load(open("ml_model.pkl", "rb"))
@@ -255,12 +197,11 @@ def background_task(update_queue):
                 predicted_latitude, predicted_longitude = 0, 0
         else:
             predicted_latitude, predicted_longitude = 0, 0
-            
+        '''
         updates = {
-            "ml_prediction": (float(new_latitude), float(new_longitude)),
             "signal_strength": rx_power,
-            "location": (rx_longitude, rx_latitude),
-            "direction": rx_direction
+            "direction": (x_direction, y_direction, z_direction),
+            "ml_prediction": (0)
         }
         update_queue.put(updates)
         print("Updates sent to UI\n")
@@ -273,7 +214,6 @@ def process_queue(ui, update_queue):
             updates = update_queue.get_nowait()
             ui.set_ml_prediction(updates["ml_prediction"])
             ui.set_signal_strength(updates["signal_strength"])
-            ui.set_location(*updates["location"])
             ui.set_direction(updates["direction"])
             ui.update_ui()
     except queue.Empty:
